@@ -1,0 +1,731 @@
+// Feedback mode, and the contributors' view of open feedback. Loaded on demand by tool.js together with the site
+// plug-in, which says what can be commented on (see tool.js).
+// A comment points at a "target" (a key from the site plug-in, such as a block's permanent id) and may quote some
+// selected words. The whole set of a person's comments on a page is sent each time, as an issue on the forge (GitHub,
+// or the forge plug-in) ("[feedback] …"); later sends are added to the same issue. People with an account send
+// through a pre-filled page on the forge;
+// anonymous people send through a web app (the feedbackEndpoint option, tools/apps-script/).
+// With the topics option (a translated book: its content and its translation), each comment says which topic it is
+// about, chosen on its card, and each topic's comments are a thread of their own in that topic's repository: sending
+// makes one issue per topic that has something new.
+FeedbackTool.register("feedback", function (site) {
+  const T = FeedbackTool;
+  const { esc, clone } = T;
+  const forge = T.forge;
+  const plain = site.plain || T.plain;
+  const cut = (s, n) => (s = plain(s)).length > n ? s.slice(0, n - 1) + "…" : s;
+  const newId = () => Math.random().toString(16).slice(2, 8);
+  const { keyOf, elFor, labelFor } = site;
+  const TARGETS = site.targets;
+  const typeName = t => (site.typeName && site.typeName(t)) || "block";
+  const fieldName = site.fieldName || (f => f);
+  const isOnPage = site.isOnPage || (key => !!elFor(key));
+  // markers: true, or "touch" for any device with a touch screen (also a touch-screen laptop), following changes
+  // such as a tablet being docked.
+  const touchQuery = T.config.markers === "touch" ? matchMedia("(any-pointer: coarse)") : null;
+  let markersOn = T.config.markers === true || !!(touchQuery && touchQuery.matches);
+  const othersOn = !!T.config.showOpenFeedback;
+
+  let me = null;            // { via: forge.id, user } or { via: "anon", name }
+  let active = false;       // feedback mode on
+  let comments = [];        // this person's comments on this page; with topics, each has about: a topic's id
+  let threads = {};         // topic id ("" without topics) -> { issue, key?, sent: { id: comment as last sent } }
+  let reviewOn = false, reviewItems = null; // contributors: the open feedback they picked to see
+  const draftKey = () => T.pageStorageKey("fb:", `:${me.via === "anon" ? "anon" : me.user.toLowerCase()}`);
+  const save = () => { try { localStorage.setItem(draftKey(), JSON.stringify({ comments, threads })); } catch (_) {} };
+  const load = () => { try { return JSON.parse(localStorage.getItem(draftKey()) || "null"); } catch (_) { return null; } };
+
+  // ---------- Topics: which thread, and which repository, a comment belongs to ----------
+  const TOPICS = T.config.topics || null;
+  const topicOf = g => TOPICS && TOPICS.find(t => t.id === g);
+  const groups = () => TOPICS ? TOPICS.map(t => t.id) : [""];
+  const groupOf = c => TOPICS ? (topicOf(c.about) ? c.about : TOPICS[0].id) : "";
+  const inGroup = g => comments.filter(c => groupOf(c) === g);
+  const repoOf = g => g ? topicOf(g).repository : T.config.repository;
+  const ABOUT_KEY = "fb-about";   // the topic the last comment was about: the next one's to start with
+  const lastAbout = () => { let a = null; try { a = localStorage.getItem(ABOUT_KEY); } catch (_) {} return topicOf(a) ? a : TOPICS[0].id; };
+
+  // The latest set of comments in a feedback issue: the last feedback-v1 block written by its author or by the robots.
+  // repo: the repository it is in, when it isn't the repository option's (the topics option).
+  async function latestState(n, repo) {
+    const [iss, coms] = await Promise.all([repo ? forge.issue(n, repo) : forge.issue(n), repo ? forge.comments(n, repo) : forge.comments(n)]);
+    if (!iss) throw new Error(`#${n} not found`);
+    const ok = new Set([iss.user, ...(forge.bots || [])].map(x => x.toLowerCase()));
+    const texts = [iss.body, ...coms.filter(c => ok.has(c.user.toLowerCase())).map(c => c.body)];
+    for (let i = texts.length - 1; i >= 0; i--) {
+      const m = (texts[i] || "").match(/```feedback-v1\s*\n([\s\S]*?)\n```/);
+      if (m) { try { return { state: await T.decompress(m[1]), issue: iss }; } catch (_) {} }
+    }
+    return { state: null, issue: iss };
+  }
+
+  // ---------- Where comments go ----------
+  // Cards go after the target's block-level host, never inside a target (so they don't disturb its text).
+  function hostOf(el) {
+    let h = el;
+    if (/^(SPAN|B|STRONG|I|EM|A|CITE|CODE)$/.test(h.tagName)) h = h.closest("p,h1,h2,h3,li,blockquote,div") || h;
+    if (h.tagName === "LI") h = h.closest("ul,ol") || h;
+    return h;
+  }
+  function stackFor(el) {
+    const host = hostOf(el);
+    let st = host.nextElementSibling;
+    if (!st || !st.classList.contains("fb-stack")) { st = document.createElement("div"); st.className = "fb-stack"; st.contentEditable = "false"; host.after(st); }
+    return st;
+  }
+
+  // ---------- Highlighting quoted words (CSS Custom Highlight API, where supported) ----------
+  function rangeFor(el, quote) {
+    const nodes = [], walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let norm = "", map = [];
+    for (let n; (n = walker.nextNode());) {
+      if (n.parentElement.closest(".fb-stack")) continue;
+      for (let i = 0; i < n.data.length; i++) {
+        const ws = /\s/.test(n.data[i]);
+        if (ws && (norm.endsWith(" ") || norm === "")) continue;
+        norm += ws ? " " : n.data[i]; map.push([n, i]);
+      }
+    }
+    let at = -1, from = 0;
+    for (let i; (i = norm.indexOf(quote.exact, from)) >= 0; from = i + 1) {
+      if (at < 0) at = i;
+      if (quote.prefix && norm.slice(Math.max(0, i - quote.prefix.length), i).trim().endsWith(quote.prefix.trim().slice(-12))) { at = i; break; }
+    }
+    if (at < 0) return null;
+    const s = map[at], e = map[at + quote.exact.length - 1];
+    const r = document.createRange(); r.setStart(s[0], s[1]); r.setEnd(e[0], e[1] + 1);
+    return r;
+  }
+  function highlight(list) {
+    if (!(window.CSS && CSS.highlights && window.Highlight)) return;
+    const ranges = [];
+    for (const { c } of list) if (c.quote) { const el = elFor(c.target), r = el && rangeFor(el, c.quote); if (r) ranges.push(r); }
+    CSS.highlights.set("fb", new Highlight(...ranges));
+  }
+
+  // ---------- Cards ----------
+  const snap = c => JSON.stringify([c.target, c.quote || null, c.text]);
+  function stateOf(c) {
+    const t = threads[groupOf(c)];
+    if (!t || !t.sent[c.id]) return "not sent yet";
+    return snap(t.sent[c.id]) === snap(c) ? "sent" : "changed, not sent yet";
+  }
+  // A proposed edit, as described by the site plug-in: deleted, inserted (new text), reordered (number of blocks), or a
+  // field with its old and new value.
+  function editCard(c) {
+    const ch = c.change, link = `<a href="${esc(c.url)}" target="_blank" rel="noopener">pull request #${c.issue}</a>`;
+    let body;
+    if (ch.deleted) body = `<p class="fb-text">Proposes deleting this ${esc(typeName(ch.type))}.</p>`;
+    else if (ch.inserted !== undefined) body = `<p class="fb-text">Proposes a new paragraph ${ch.atStart ? "at the start of this section" : "after this"}:</p><p class="fb-text fb-new">${esc(plain(ch.inserted))}</p>`;
+    else if (ch.reordered) body = `<p class="fb-text">Proposes a new order for the ${ch.reordered} blocks here.</p>`;
+    else if (typeof ch.new === "string" && (typeof ch.old === "string" || ch.old == null)) {
+      const label = fieldName(ch.field);
+      body = `${label ? `<p class="fb-label">${esc(label)}</p>` : ""}<p class="fb-text fb-new">${esc(plain(ch.new)) || "<i>(empty)</i>"}</p>
+        ${ch.old ? `<details class="fb-was"><summary>Current text</summary><p class="fb-text">${esc(plain(ch.old))}</p></details>` : ""}`;
+    } else {
+      const a = Array.isArray(ch.old) ? ch.old : [], b = Array.isArray(ch.new) ? ch.new : [];
+      const n = Array.isArray(ch.old) || Array.isArray(ch.new) ? [
+        [b.slice(0, a.length).filter((x, i) => JSON.stringify(x) !== JSON.stringify(a[i])).length, "changed"],
+        [Math.max(0, b.length - a.length), "added"], [Math.max(0, a.length - b.length), "removed"]].filter(([k]) => k).map(([k, w]) => `${k} ${w}`).join(", ") : "";
+      body = `<p class="fb-text">Proposes changes to the ${esc(fieldName(ch.field) || "text")}${n ? ` (entries: ${n})` : ""}. See the ${link} for the details.</p>`;
+    }
+    return `<div class="fb-card fb-edit" data-cid="${esc(c.id)}"><div class="fb-head">✏️ Proposed edit · ${esc(c.author)} · ${link}</div>${body}</div>`;
+  }
+  function card(c, own) {
+    if (c.change) return editCard(c);
+    const head = own ? `💬 Your comment${TOPICS ? ` <span class="fb-tag fb-tag-about">${esc(topicOf(groupOf(c)).short || topicOf(groupOf(c)).label)}</span>` : ""} <span class="fb-state">· ${stateOf(c)}</span>`
+      : `💬 ${esc(c.author)} · <a href="${esc(c.url)}" target="_blank" rel="noopener">#${c.issue}</a>`;
+    return `<div class="fb-card${own ? "" : " fb-other"}" data-cid="${c.id}"><div class="fb-head">${head}</div>
+      ${c.quote ? `<blockquote class="fb-quote">“${esc(c.quote.exact)}”</blockquote>` : ""}<p class="fb-text">${esc(c.text)}</p>
+      ${own ? `<div class="fb-actions"><button type="button" data-fb="edit">Edit</button><button type="button" data-fb="del">Delete</button></div>` : ""}</div>`;
+  }
+  function refresh() {
+    document.querySelectorAll(".fb-stack").forEach(x => x.remove());
+    const list = [];
+    if (active) comments.forEach(c => list.push({ c, own: true }));
+    if (reviewOn && reviewItems) reviewItems.forEach(c => list.push({ c, own: false }));
+    for (const { c, own } of list) { const el = elFor(c.target); if (el) stackFor(el).insertAdjacentHTML("beforeend", card(c, own)); }
+    highlight(list);
+    updateBar();
+    scheduleMarkers();
+  }
+  // With topics: what the comment is about, on its card, so each comment can be about a different one.
+  const aboutChoice = g => `<span class="fb-about" role="radiogroup" aria-label="What is this comment about?">${TOPICS.map(t =>
+    `<button type="button" role="radio" data-fb="about" data-about="${esc(t.id)}" aria-checked="${t.id === g}" title="${esc(t.label)}: goes to ${esc(t.repository)}">${esc(t.short || t.label)}</button>`).join("")}</span>`;
+  function openComposer(key, quote, id) {
+    const el = elFor(key); if (!el) return;
+    document.querySelectorAll(".fb-composer").forEach(x => x.remove());
+    const existing = id && comments.find(c => c.id === id);
+    const html = `<div class="fb-card fb-composer" data-key="${esc(key)}"${id ? ` data-cid="${id}"` : ""}>
+      <div class="fb-head">💬 ${quote || (existing && existing.quote) ? "Comment on the selected words" : `Comment on ${esc(labelFor(key))}`}</div>
+      ${(quote || (existing && existing.quote)) ? `<blockquote class="fb-quote">“${esc((quote || existing.quote).exact)}”</blockquote>` : ""}
+      <textarea rows="3" placeholder="Your comment…">${existing ? esc(existing.text) : ""}</textarea>
+      <div class="fb-actions">${TOPICS ? aboutChoice(existing ? groupOf(existing) : lastAbout()) : ""}<button type="button" data-fb="cancel">Cancel</button><button type="button" class="primary" data-fb="save">Save comment</button></div></div>`;
+    const cardEl = id && document.querySelector(`.fb-card[data-cid="${id}"]:not(.fb-other)`);
+    if (cardEl) cardEl.outerHTML = html; else stackFor(el).insertAdjacentHTML("beforeend", html);
+    const comp = document.querySelector(".fb-composer");
+    comp._quote = quote || null;
+    comp.querySelector("textarea").focus();
+    hideButtons();
+  }
+
+  // ---------- Floating "💬" buttons ----------
+  let hoverBtn, selBtn, hoverTarget = null, selInfo = null;
+  function makeButtons() {
+    hoverBtn = document.createElement("button"); hoverBtn.type = "button"; hoverBtn.className = "fb-float"; hoverBtn.textContent = "💬 Comment"; hoverBtn.hidden = true;
+    selBtn = document.createElement("button"); selBtn.type = "button"; selBtn.className = "fb-float fb-float-sel"; selBtn.textContent = "💬 Comment on selection"; selBtn.hidden = true;
+    hoverBtn.addEventListener("mousedown", e => e.preventDefault());
+    selBtn.addEventListener("mousedown", e => e.preventDefault());
+    hoverBtn.addEventListener("click", () => { if (hoverTarget) openComposer(keyOf(hoverTarget), null); });
+    selBtn.addEventListener("click", () => { if (selInfo) { openComposer(keyOf(selInfo.el), selInfo.quote); getSelection().removeAllRanges(); } });
+  }
+  function place(btn, el, rect, x, y) {
+    const parent = el.closest("dialog") || document.body;
+    if (btn.parentElement !== parent) parent.appendChild(btn);
+    btn.hidden = false;
+    btn.style.top = `${Math.max(4, y)}px`;
+    btn.style.left = `${Math.min(innerWidth - btn.offsetWidth - 8, Math.max(4, x))}px`;
+  }
+  function hideButtons() { if (hoverBtn) hoverBtn.hidden = true; if (selBtn) selBtn.hidden = true; }
+  // The tool's own controls, and the site's.
+  const OWN = ".fb-stack, .fb-float, .fb-markers, .fb-chooser, .fb-bar, .fb-fab, dialog.fb-dialog" + (site.ignore ? `, ${site.ignore}` : "");
+  const ignore = n => !n || n.closest(OWN);
+  // With markers on, they take the place of the button that follows the pointer.
+  function onOver(e) {
+    if (!active || markersOn || ignore(e.target)) return;
+    const t = e.target.closest(TARGETS); if (!t || t === hoverTarget) return;
+    hoverTarget = t;
+    const r = t.getBoundingClientRect();
+    place(hoverBtn, t, r, r.right - 120, r.top - 14);
+  }
+  function selectionInfo() {
+    const sel = getSelection(); if (!sel.rangeCount || sel.isCollapsed) return null;
+    const r = sel.getRangeAt(0), el = n => n.nodeType === 1 ? n : n.parentElement;
+    if (ignore(el(r.startContainer))) return null;
+    const t1 = el(r.startContainer).closest(TARGETS), t2 = el(r.endContainer).closest(TARGETS);
+    if (!t1 || t1 !== t2) return null;
+    const exact = sel.toString().replace(/\s+/g, " ").trim(); if (!exact || exact.length > 600) return null;
+    const pre = document.createRange(); pre.selectNodeContents(t1); pre.setEnd(r.startContainer, r.startOffset);
+    const post = document.createRange(); post.selectNodeContents(t1); post.setStart(r.endContainer, r.endOffset);
+    return { el: t1, quote: { exact, prefix: pre.toString().replace(/\s+/g, " ").slice(-32), suffix: post.toString().replace(/\s+/g, " ").slice(0, 32) }, rect: r.getBoundingClientRect() };
+  }
+  function onSelect() {
+    if (!active) return;
+    selInfo = selectionInfo();
+    if (!selInfo) { selBtn.hidden = true; return; }
+    const r = selInfo.rect;
+    place(selBtn, selInfo.el, r, r.left, r.bottom + 6);
+  }
+  // On touch screens a selection ends without a mouseup, so wait for it to settle instead.
+  let lastPointer = "mouse", selTimer = 0;
+  const onPointer = e => { lastPointer = e.pointerType; };
+  const onSelectionChange = () => { if (lastPointer !== "touch") return; clearTimeout(selTimer); selTimer = setTimeout(onSelect, 400); };
+
+  // ---------- Markers (the markers option) ----------
+  // A 💬 beside every part that can be commented on, for touch screens, where pointing and selecting work poorly.
+  // They sit in a layer of their own (on the page, or in the dialog the part is in), placed from each part's box, so
+  // the page's content is untouched. They are placed again whenever the layout may have changed.
+  // Each marker is a 28px circle in a 40px button, so it is easy to tap.
+  const SIZE = 28, PAD = 6, HIT = SIZE + 2 * PAD, labels = new Map(), scrollers = new WeakMap();
+  let frame = 0;
+  function scheduleMarkers() { if (T.config.markers && !frame) frame = requestAnimationFrame(placeMarkers); }
+  function markersChanged() {
+    document.body.classList.toggle("fb-with-markers", active && markersOn);
+    if (!markersOn) document.querySelectorAll(".fb-markers-room").forEach(h => h.classList.remove("fb-markers-room"));
+    const h = bar && bar.querySelector(".fb-hint"); if (h) h.textContent = hint();
+    scheduleMarkers();
+  }
+  // The nearest ancestor that clips its content (a scrolling panel, say), so markers for hidden parts are left out.
+  function clipperOf(el, host) {
+    if (!scrollers.has(el)) {
+      let c = null;
+      for (let p = el.parentElement; p && p !== host && p !== document.body; p = p.parentElement) {
+        const s = getComputedStyle(p); if (/auto|scroll|hidden|clip/.test(s.overflowX + s.overflowY)) { c = p; break; }
+      }
+      scrollers.set(el, c);
+    }
+    return scrollers.get(el);
+  }
+  // An inline part (a name within a line, say) is marked at the right edge of the block it sits in, not where its
+  // text ends, so the marker doesn't land on the rest of the line.
+  const blocks = new WeakMap();
+  function blockOf(el) {
+    if (!blocks.has(el)) {
+      let b = el;
+      while (b.parentElement && getComputedStyle(b).display.startsWith("inline")) b = b.parentElement;
+      blocks.set(el, b);
+    }
+    return blocks.get(el);
+  }
+  const overlaps = (a, c) => a.left < c.right && c.left < a.right && a.top < c.bottom && c.top < a.bottom;
+  // One marker per row: parts that start within a marker's height of each other share a marker, level with the first
+  // of them, so markers never drift away from their parts or overlap, however densely parts are nested (an exercise,
+  // its paragraph and a list item, say). A marker for several parts asks which one the comment is about.
+  // Each marker goes just right of its row's parts if that spot is free: inside the page or dialog, and clear of other
+  // parts and of the site's own controls (its ignore list, such as a dialog's close button). Otherwise it goes in a
+  // margin that the tool gives the page or dialog (class fb-markers-room, kept while markers show).
+  // A page or dialog whose markers haven't moved keeps them as they are (and any list that is open), so pages that
+  // keep changing (maths still rendering, say) don't rebuild them all the time.
+  function placeMarkers() {
+    frame = 0;
+    if (!active || !markersOn) return document.querySelectorAll(".fb-markers").forEach(l => l.remove());
+    const hosts = new Map();   // the page or dialog -> its parts, with their boxes
+    for (const el of document.querySelectorAll(TARGETS)) {
+      if (ignore(el)) continue;
+      const dlg = el.closest("dialog"); if (dlg && !dlg.open) continue;
+      const r = el.getBoundingClientRect(); if (!r.width || !r.height) continue;
+      const host = dlg || document.body, clip = clipperOf(el, host);
+      if (clip) { const v = clip.getBoundingClientRect(); if (r.bottom <= v.top || r.top >= v.bottom) continue; }
+      const block = blockOf(el);
+      if (!hosts.has(host)) hosts.set(host, []);
+      hosts.get(host).push({ el, r, right: block === el ? r.right : block.getBoundingClientRect().right });
+    }
+    let again = false;
+    for (const [host, parts] of hosts) {
+      const dlg = host === document.body ? null : host, hr = host.getBoundingClientRect();
+      const room = dlg ? hr.right : document.documentElement.clientWidth, roomy = host.classList.contains("fb-markers-room");
+      const controls = site.ignore ? [...host.querySelectorAll(site.ignore)].filter(c => c.closest("dialog") === dlg)
+        .map(c => c.getBoundingClientRect()).filter(c => c.width && c.height) : [];
+      const boxAt = (x, y) => ({ left: x - PAD, top: y - PAD, right: x - PAD + HIT, bottom: y - PAD + HIT });
+      const rows = [];
+      for (const p of [...parts].sort((a, b) => a.r.top - b.r.top)) {
+        const row = rows[rows.length - 1];
+        if (row && p.r.top < row.top + HIT) row.parts.push(p); else rows.push({ top: p.r.top, parts: [p] });
+      }
+      const related = (q, row) => row.parts.some(p => p === q || q.el.contains(p.el) || p.el.contains(q.el));
+      const margin = Math.min(hr.right, room) - HIT + PAD;   // x of a marker in the margin
+      let layer = [...host.children].find(c => c.classList.contains("fb-markers"));
+      if (!layer) { layer = document.createElement("div"); layer.className = "fb-markers"; host.appendChild(layer); }
+      const o = layer.getBoundingClientRect(), specs = [];
+      for (const row of rows) {
+        let x = Math.max(...row.parts.map(p => p.right)) + 6, y = row.top;
+        const box = boxAt(x, y);
+        const free = x + SIZE + PAD <= room && !controls.some(c => overlaps(box, c)) && !parts.some(q => !related(q, row) && overlaps(box, q.r));
+        if (!free) {
+          if (!roomy) { host.classList.add("fb-markers-room"); again = true; break; }
+          x = margin;
+          // Off any of the site's controls that reach into the margin.
+          for (let i = 0; i < controls.length; i++) if (overlaps(boxAt(x, y), controls[i])) { y = controls[i].bottom + PAD; i = -1; }
+        }
+        specs.push({ keys: row.parts.map(p => keyOf(p.el)), left: Math.round(x - PAD - o.left), top: Math.round(y - PAD - o.top) });
+      }
+      if (again) break;
+      const sig = JSON.stringify(specs);
+      if (layer._sig === sig) continue;
+      layer._sig = sig; layer.textContent = "";
+      for (const { keys, left, top } of specs) {
+        keys.forEach(k => { if (!labels.has(k)) labels.set(k, labelFor(k)); });
+        const b = document.createElement("button");
+        b.type = "button"; b.className = "fb-marker"; b.innerHTML = "<span>💬</span>"; b.dataset.keys = JSON.stringify(keys);
+        b.title = keys.length === 1 ? `Comment on ${labels.get(keys[0])}` : `Comment on one of the ${keys.length} parts here`;
+        b.setAttribute("aria-label", b.title); if (keys.length > 1) b.setAttribute("aria-haspopup", "menu");
+        b.style.left = `${left}px`; b.style.top = `${top}px`;
+        layer.appendChild(b);
+      }
+    }
+    // Markers in pages or dialogs with nothing to mark now (a dialog that has closed) go.
+    document.querySelectorAll(".fb-markers").forEach(l => { if (!hosts.has(l.parentElement)) l.remove(); });
+    // A page or dialog has just been given a margin: place everything again once the layout has followed.
+    if (again) { document.querySelectorAll(".fb-markers").forEach(l => l.remove()); scheduleMarkers(); }
+  }
+  // The list a marker for several parts opens: one button per part, in the order they appear. It sits beside the
+  // markers rather than among them, so it stays open while they are placed again (a page still settling, say).
+  function showChooser(marker) {
+    closeChooser();
+    const keys = JSON.parse(marker.dataset.keys), menu = document.createElement("div"), layer = marker.parentElement;
+    menu.className = "fb-chooser"; menu.setAttribute("role", "menu");
+    menu.innerHTML = `<div class="fb-chooser-head">Comment on…</div>` + keys.map(k =>
+      `<button type="button" role="menuitem" data-key="${esc(k)}">${esc(cut(labels.get(k) || labelFor(k), 80))}</button>`).join("");
+    layer.parentElement.appendChild(menu);
+    // To the left of the marker, inside the window and above the feedback bar (scrolling itself if it has to).
+    const floor = (bar ? bar.getBoundingClientRect().top : innerHeight) - 8;
+    menu.style.maxHeight = `${Math.max(120, floor - 8)}px`;
+    const m = marker.getBoundingClientRect(), w = menu.getBoundingClientRect(), o = layer.getBoundingClientRect();
+    const left = Math.max(8, Math.min(m.left - w.width - 4, innerWidth - w.width - 8)), top = Math.max(8, Math.min(m.top, floor - w.height));
+    menu.style.left = `${left - o.left}px`; menu.style.top = `${top - o.top}px`;
+    menu.querySelector("button").focus({ preventScroll: true });
+  }
+  function closeChooser() { document.querySelectorAll(".fb-chooser").forEach(m => m.remove()); }
+
+  // ---------- Card actions ----------
+  function onClick(e) {
+    const m = e.target.closest(".fb-marker");
+    if (m) { const keys = JSON.parse(m.dataset.keys); return keys.length > 1 ? showChooser(m) : (closeChooser(), openComposer(keys[0], null)); }
+    const pick = e.target.closest(".fb-chooser [data-key]"); if (pick) { closeChooser(); return openComposer(pick.dataset.key, null); }
+    if (!e.target.closest(".fb-chooser")) closeChooser();
+    const b = e.target.closest("[data-fb]"); if (!b) return;
+    const box = b.closest(".fb-card"), id = box && box.dataset.cid;
+    if (b.dataset.fb === "about") { box.querySelectorAll("[data-fb=about]").forEach(x => x.setAttribute("aria-checked", String(x === b))); return; }
+    if (b.dataset.fb === "cancel") { box.remove(); refresh(); }
+    if (b.dataset.fb === "edit") { const c = comments.find(x => x.id === id); if (c) openComposer(c.target, null, id); }
+    if (b.dataset.fb === "del") { if (confirm("Delete this comment?")) { comments = comments.filter(x => x.id !== id); save(); refresh(); } }
+    if (b.dataset.fb === "save") {
+      const text = box.querySelector("textarea").value.trim();
+      if (!text) return box.querySelector("textarea").focus();
+      const picked = box.querySelector('[data-fb=about][aria-checked="true"]'), about = picked ? { about: picked.dataset.about } : {};
+      if (picked) try { localStorage.setItem(ABOUT_KEY, picked.dataset.about); } catch (_) {}
+      const existing = id && comments.find(x => x.id === id);
+      if (existing) Object.assign(existing, { text }, about);
+      else { const key = box.dataset.key; comments.push({ id: newId(), target: key, where: labelFor(key), ...(box._quote ? { quote: box._quote } : {}), text, ...about }); }
+      save(); refresh();
+    }
+  }
+
+  // ---------- Bar ----------
+  let bar;
+  // What has changed in topic g's thread since it was last sent. A comment moved to another topic counts as
+  // withdrawn from this one and added to that one.
+  function changes(g) {
+    const t = threads[g], sent = t ? t.sent : {}, mine = inGroup(g), now = new Set(mine.map(c => c.id));
+    return {
+      added: mine.filter(c => !sent[c.id]),
+      changed: mine.filter(c => sent[c.id] && snap(sent[c.id]) !== snap(c)),
+      withdrawn: Object.values(sent).filter(c => !now.has(c.id)),
+    };
+  }
+  const pendingIn = g => { const ch = changes(g); return ch.added.length + ch.changed.length + ch.withdrawn.length; };
+  const pending = () => groups().reduce((n, g) => n + pendingIn(g), 0);
+  const toSend = () => groups().filter(g => pendingIn(g));
+  const hint = () => !markersOn ? "Point at any part of the page and click 💬, or select some words."
+    : `${matchMedia("(any-pointer: coarse)").matches ? "Tap" : "Click"} 💬 beside any part of the page, or select some words.`;
+  const whoLabel = () => me.via === "anon" ? (me.name ? `${esc(me.name)} (anonymous)` : "anonymous") : `@${esc(me.user)}`;
+  function updateBar() {
+    if (!bar) return;
+    const n = pending(), total = comments.length;
+    bar.querySelector(".fb-count").textContent = !total && !n ? "No comments yet" : `${total} comment${total === 1 ? "" : "s"}${n ? ` · ${n} not sent` : " · all sent"}`;
+    bar.querySelector("[data-fbbar=send]").disabled = !n;
+    bar.querySelector(".fb-thread").innerHTML = groups().filter(g => threads[g]).map(g => { const t = threads[g];
+      return `${TOPICS ? `${esc(topicOf(g).short || topicOf(g).label)}: ` : "In "}<a href="${esc(T.issueURL(t.issue, repoOf(g)))}" target="_blank" rel="noopener">#${t.issue}</a>${t.key ? ` · <button type="button" class="fb-link" data-fbbar="link" data-g="${esc(g)}">copy private link</button>` : ""}`; }).join(" · ");
+    if (othersOn) {
+      const n = reviewOn ? shown.size : 0, o = bar.querySelector("[data-fbbar=others]");
+      o.textContent = n ? `Others' feedback (${n})` : "Others' feedback"; o.setAttribute("aria-pressed", n > 0);
+      bar.querySelector("[data-fbbar=othershide]").hidden = !n;
+    }
+  }
+  function showBar() {
+    bar = document.createElement("div");
+    bar.className = "fb-bar";
+    bar.innerHTML = `<div class="fb-bar-in"><b>💬 Feedback</b><span class="fb-who">as ${whoLabel()} · <button type="button" class="fb-link" data-fbbar="signout">not you?</button></span>
+      <span class="fb-count"></span><span class="fb-thread"></span>
+      <span class="fb-hint">${hint()}</span>
+      ${othersOn ? `<button type="button" data-fbbar="others" aria-pressed="false">Others' feedback</button><button type="button" data-fbbar="othershide" hidden>Hide</button>` : ""}<button type="button" data-fbbar="stop">Close</button><button type="button" class="primary" data-fbbar="send">Review &amp; send</button></div>`;
+    document.body.appendChild(bar);
+    // The page keeps room at its end for the bar, however many lines it takes on a narrow screen (feedback.css).
+    new ResizeObserver(() => document.documentElement.style.setProperty("--fb-bar", `${bar.offsetHeight}px`)).observe(bar);
+    bar.addEventListener("click", e => {
+      const b = e.target.closest("[data-fbbar]"); if (!b) return;
+      if (b.dataset.fbbar === "others") chooseOpenFeedback({ edits: false }).then(updateBar);
+      if (b.dataset.fbbar === "othershide") hideOpenFeedback();
+      if (b.dataset.fbbar === "send") review();
+      if (b.dataset.fbbar === "stop") { if (!pending() || confirm("Close feedback? Comments you haven't sent stay saved in this browser.")) location.reload(); }
+      if (b.dataset.fbbar === "signout") T.signOut();
+      if (b.dataset.fbbar === "link") copyLink(b, b.dataset.g || "");
+    });
+    updateBar();
+  }
+  // A private link continues one thread: #fb=<issue>-<key>, or #fb=<topic>.<issue>-<key> with topics.
+  const privateLink = g => `${location.origin}${location.pathname}#fb=${g ? `${g}.` : ""}${threads[g].issue}-${threads[g].key}`;
+  function copyLink(btn, g) {
+    try { navigator.clipboard.writeText(privateLink(g)); btn.textContent = "link copied"; setTimeout(() => { btn.textContent = "copy private link"; }, 2000); }
+    catch (_) { prompt("Your private link:", privateLink(g)); }
+  }
+
+  // ---------- Review and send ----------
+  function bodyFor(g, note, payload64) {
+    const pageTitle = site.pageTitle(), thread = threads[g], topic = topicOf(g);
+    const ch = changes(g);
+    const item = (c, i) => `${i + 1}. **On ${c.where}**\n${c.quote ? `   > ${c.quote.exact}\n\n` : ""}   ${c.text.replace(/\n/g, "\n   ")}`;
+    const parts = [thread ? `**More feedback for #${thread.issue}** (${pageTitle})` : `**Feedback on ${pageTitle}**${topic ? ` · ${topic.short || topic.label}` : ""}`,
+      `From: ${me.via === "anon" ? (me.name ? `${me.name} (anonymous)` : "anonymous") : `@${me.user}`}`];
+    if (ch.added.length) parts.push(`**New**\n\n${ch.added.map(item).join("\n\n")}`);
+    if (ch.changed.length) parts.push(`**Changed**\n\n${ch.changed.map(item).join("\n\n")}`);
+    if (ch.withdrawn.length) parts.push(`**Withdrawn**\n\n${ch.withdrawn.map((c, i) => `${i + 1}. ~~On ${c.where}: ${cut(c.text, 80)}~~`).join("\n")}`);
+    if (note) parts.push(`**Note**\n\n${note}`);
+    if (topic && topic.notes) { const more = topic.notes(inGroup(g)); if (more) parts.push(more); }
+    parts.push(T.pageLine(), `<details><summary>Technical details for the robot (please do not edit)</summary>\n\n\`\`\`feedback-v1\n${payload64}\n\`\`\`\n</details>`);
+    return { pageTitle, body: parts.join("\n\n") + "\n" };
+  }
+  function review() {
+    const dlg = document.createElement("dialog"), gs = toSend();
+    dlg.className = "fb-dialog";
+    const li = (c, tag) => `<li><span><b>${tag}</b> on ${esc(c.where)}: “${esc(cut(c.text, 80))}”</span></li>`;
+    // With topics, each thread is listed under where it goes.
+    const section = g => { const ch = changes(g), t = threads[g], topic = topicOf(g);
+      return `${topic ? `<h3 class="fb-group">${esc(topic.short || topic.label)} <small>→ ${esc(topic.repository)}</small></h3>` : ""}
+      ${t ? `<p class="fb-explain">This will be added to your earlier feedback, <a href="${esc(T.issueURL(t.issue, repoOf(g)))}" target="_blank" rel="noopener">#${t.issue}</a>.</p>` : ""}
+      <ul class="fb-items">${[...ch.added.map(c => li(c, "New")), ...ch.changed.map(c => li(c, "Changed")), ...ch.withdrawn.map(c => li(c, "Withdrawn"))].join("")}</ul>`; };
+    const two = gs.length > 1;
+    dlg.innerHTML = `<h2>Send your feedback</h2>
+      ${gs.map(section).join("")}
+      <label class="fb-field">Anything else? <span>(optional${two ? ", added to both" : ""})</span><textarea rows="2"></textarea></label>
+      <p class="fb-explain">${me.via === "anon" ? `Your feedback is sent straight away${two ? " to both repositories, and you get a private link to each" : ", and you get a private link"} to come back to it.`
+        : two ? `Sending opens ${esc(forge.name)} in a new tab for the first repository, then asks you to open the second. Click <b>Create</b> in each.`
+        : `Sending opens ${esc(forge.name)} in a new tab with your feedback filled in. Click <b>Create</b> there.`} Feedback is public on ${esc(forge.name)}.</p>
+      <div class="fb-buttons"><button type="button" data-r="back">Keep going</button><button type="button" class="primary" data-r="send">Send</button></div>`;
+    document.body.appendChild(dlg); dlg.showModal();
+    dlg.addEventListener("close", () => dlg.remove());
+    dlg.addEventListener("click", e => {
+      const r = e.target.closest("[data-r]"); if (!r) return;
+      if (r.dataset.r === "back") (dlg.close(), dlg.remove());
+      if (r.dataset.r === "send") (me.via === "anon" ? sendAnon : sendGitHub)(dlg, dlg.querySelector("textarea").value.trim());
+    });
+  }
+  // The thread's comments, without about: the whole thread is about its topic, which payload says.
+  const strip = ({ about, ...c }) => clone(c);
+  const payloadNow = g => ({ version: 1, kind: "feedback", page: T.pagePath(), from: me.via === "anon" ? { via: "anon", name: me.name || "" } : { via: forge.id, user: me.user },
+    ...(threads[g] ? { follows: threads[g].issue } : {}), ...(topicOf(g) && topicOf(g).payload), comments: inGroup(g).map(strip) });
+  const markSent = g => { threads[g].sent = Object.fromEntries(inGroup(g).map(c => [c.id, clone(c)])); save(); refresh(); };
+  async function issueFor(g, note) {
+    const { pageTitle, body } = bodyFor(g, note, await T.compress(payloadNow(g)));
+    const mine = inGroup(g), first = mine[0] ? cut(mine[0].text, 60) : "comments", t = threads[g];
+    return { title: t ? `[feedback] ${pageTitle}: update to #${t.issue}` : `[feedback] ${pageTitle}: ${first}`, body };
+  }
+  const where = g => topicOf(g) ? ` (${esc(topicOf(g).short || topicOf(g).label).toLowerCase()})` : "";
+
+  // Anonymous: one request to the web app per thread with something new, each naming its repository.
+  async function sendAnon(dlg, note) {
+    dlg.innerHTML = `<h2>Sending…</h2>`;
+    const sent = [], failed = [];
+    for (const g of toSend()) {
+      const { title, body } = await issueFor(g, note), t = threads[g];
+      let res = null;
+      try { res = await (await fetch(T.config.feedbackEndpoint, { method: "POST", body: JSON.stringify({ repository: repoOf(g), title, body, ...(t ? { follows: t.issue, key: t.key } : {}), website: "" }) })).json(); } catch (_) {}
+      if (!res || !res.issue) { failed.push([g, res && res.error]); continue; }
+      if (!threads[g]) threads[g] = { issue: res.issue, key: res.key, sent: {} };
+      markSent(g); sent.push(g);
+    }
+    if (!sent.length) {
+      const why = failed.map(([, e]) => e).filter(Boolean)[0];
+      dlg.innerHTML = `<h2>That didn't work</h2><p>Your feedback couldn't be sent${why ? ` (${esc(why)})` : ""}. It's still saved in this browser; please try again later.</p><div class="fb-buttons"><button type="button" class="primary" data-r="back">OK</button></div>`;
+      return;
+    }
+    const issue = g => `<a href="${esc(T.issueURL(threads[g].issue, repoOf(g)))}" target="_blank" rel="noopener">#${threads[g].issue}</a>${where(g)}`;
+    const links = sent.filter(g => threads[g].key);
+    dlg.innerHTML = `<h2>Thank you!</h2>
+      <p>Your feedback is ${sent.map(issue).join(" and ")}. If you add more comments, they'll be added to ${sent.length > 1 ? "them" : "it"}.</p>
+      ${failed.length ? `<p class="fb-gate-msg">The rest${failed.map(([g]) => where(g)).join("")} couldn't be sent just now. It's still saved in this browser; please send again later.</p>` : ""}
+      ${links.length ? `<p><b>Your private link${links.length > 1 ? "s" : ""}</b>: use ${links.length > 1 ? "them" : "it"} to come back to your feedback from any device. Keep ${links.length > 1 ? "them to yourself; anyone with one can add to that feedback" : "it to yourself; anyone with it can add to your feedback"}.</p>
+      ${links.map(g => `<p class="fb-linkbox">${TOPICS ? `<span>${esc(topicOf(g).short || topicOf(g).label)}</span>` : ""}<input type="text" readonly value="${esc(privateLink(g))}"><button type="button" data-r="copy" data-g="${esc(g)}">Copy</button></p>`).join("")}` : ""}
+      <div class="fb-buttons"><button type="button" data-r="back">Keep going</button><button type="button" class="primary" data-r="done">I'm finished</button></div>`;
+    dlg.addEventListener("click", e => {
+      const r = e.target.closest("[data-r]"); if (!r) return;
+      if (r.dataset.r === "copy") copyLink(r, r.dataset.g || "");
+      if (r.dataset.r === "done") location.reload();
+    });
+  }
+
+  // With an account: a pre-filled new-issue page per thread with something new. A browser lets a click open one new
+  // tab, so the first opens straight away and each next one waits for a click of its own.
+  async function sendGitHub(dlg, note) {
+    const gs = toSend();
+    const pages = await Promise.all(gs.map(async g => ({ g, ...(await issueFor(g, note)) })));
+    const sentAt = Date.now();
+    let opened = 0;
+    // Each page's link is made as it opens: feedback too long for a link is copied then, so the clipboard holds the
+    // feedback of the page just opened.
+    const openNext = () => {
+      const p = pages[opened++];
+      Object.assign(p, T.newIssueLink(p.title, p.body, "Paste your feedback here (Ctrl+V or ⌘V), replacing this line.", TOPICS ? repoOf(p.g) : undefined));
+      window.open(p.url, "_blank", "noopener"); show();
+    };
+    const show = () => {
+      const p = pages[opened - 1], next = pages[opened], many = pages.length > 1;
+      dlg.innerHTML = `<h2>${next ? `Opened ${opened} of ${pages.length}` : "Almost done"}</h2>
+        <p>${esc(forge.name)} has opened in a new tab${many ? ` for your feedback${where(p.g)}, on ${esc(repoOf(p.g))}` : ""}.${p.pasted ? ` ${many ? "It" : "Your feedback"} was too long to fill in automatically, so it has been <b>copied</b>: paste it into the description box.` : ""} Click <b>Create</b> there to send it.</p>
+        ${next ? `<div class="fb-buttons"><button type="button" class="primary" data-r="next">Now open the ${["second", "third"][opened - 1] || "next"}${where(next.g)}, on ${esc(repoOf(next.g))}</button></div>` : ""}
+        <p class="fb-explain">If ${esc(forge.name)} showed an error while you were signing in, <button type="button" class="fb-link" data-r="again">open it again</button>.</p>
+        ${p.pasted ? `<details><summary>If pasting doesn't work, copy this text</summary><textarea rows="6" readonly>${esc(p.body)}</textarea></details>` : ""}
+        ${next ? "" : `<div class="fb-buttons fb-buttons-wrap"><button type="button" data-r="back">Not sent yet</button><button type="button" data-r="sentkeep">I've sent ${many ? "them" : "it"}: keep going</button><button type="button" class="primary" data-r="sentdone">I've sent ${many ? "them" : "it"}: I'm finished</button></div>`}`;
+    };
+    openNext();
+    dlg.addEventListener("click", async e => {
+      const r = e.target.closest("[data-r]"); if (!r) return;
+      if (r.dataset.r === "again") return void window.open(pages[opened - 1].url, "_blank", "noopener");
+      if (r.dataset.r === "next") return openNext();
+      if (r.dataset.r !== "sentkeep" && r.dataset.r !== "sentdone") return;
+      for (const { g } of pages) {
+        // A forge that can't look up the new issue (or several threads at once): what was sent is on the forge now,
+        // and comments added from here on are sent as new feedback.
+        if (!threads[g] && (!forge.issuesBy || TOPICS)) { comments = comments.filter(c => groupOf(c) !== g); save(); refresh(); continue; }
+        if (!threads[g]) {
+          dlg.innerHTML = `<h2>Finding your feedback on ${esc(forge.name)}…</h2><p class="fb-explain">This takes a few seconds.</p>`;
+          const n = await T.findIssue({ user: me.user, prefix: "[feedback]", since: sentAt });
+          if (!n) { dlg.innerHTML = `<h2>Couldn't find it yet</h2><p>If you did click Create, your next comments will be sent as separate feedback, which works too.</p><div class="fb-buttons"><button type="button" class="primary" data-r="back">OK</button></div>`; return; }
+          threads[g] = { issue: n, sent: {} };
+        }
+        markSent(g);
+      }
+      if (r.dataset.r === "sentdone") location.reload(); else (dlg.close(), dlg.remove());
+    });
+  }
+
+  // ---------- Start ----------
+  // Continue thread n of topic g: its comments as last sent replace that topic's comments here.
+  async function adopt(n, key, g = "") {
+    const { state, issue } = await latestState(n, TOPICS ? repoOf(g) : undefined);
+    if (issue.state === "closed") return false;
+    const theirs = (state ? state.comments : []).map(c => TOPICS ? { ...c, about: g } : c);
+    comments = [...comments.filter(c => groupOf(c) !== g), ...theirs];
+    threads[g] = { issue: n, ...(key ? { key } : {}), sent: Object.fromEntries(theirs.map(c => [c.id, clone(c)])) };
+    if (state && state.from && state.from.via === "anon" && state.from.name && !me.name) me.name = state.from.name;
+    save();
+    return true;
+  }
+  async function start(who) {
+    if (active) return;
+    me = { via: who.via, ...(who.user ? { user: who.user } : {}), ...(who.via === "anon" ? { name: who.name || "" } : {}) };
+    active = true;
+    document.body.classList.add("feedback-mode");
+    // While markers show, the page has the class fb-with-markers.
+    if (markersOn) document.body.classList.add("fb-with-markers");
+    if (touchQuery) touchQuery.addEventListener("change", e => { markersOn = e.matches; markersChanged(); });
+    if (TOPICS) await Promise.all(TOPICS.map(t => t.prepare ? t.prepare() : null));
+    try {
+      const d = load();
+      if (d) { comments = d.comments || []; threads = d.threads || (d.thread ? { "": d.thread } : {}); }
+      if (who.recover) {
+        // Private link: continue that anonymous feedback here.
+        const g = TOPICS ? (topicOf(who.recover.topic) ? who.recover.topic : TOPICS[0].id) : "";
+        if (!(await adopt(who.recover.issue, who.recover.key, g))) alert(`Feedback #${who.recover.issue} has been closed by the team. You can start new feedback.`);
+        history.replaceState(null, "", location.pathname + location.search);
+      } else {
+        // Drop a thread once the team has closed it; keep anything not yet sent.
+        for (const g of Object.keys(threads)) {
+          const t = threads[g], st = await forge.issue(t.issue, TOPICS ? repoOf(g) : undefined).catch(() => null);
+          if (st && st.state === "closed") { comments = comments.filter(c => !(groupOf(c) === g && t.sent[c.id])); delete threads[g]; save(); }
+        }
+        if (!TOPICS && !threads[""] && me.via !== "anon" && forge.issuesBy) {
+          // Offer to continue earlier open feedback on this page.
+          const list = await forge.issuesBy(me.user).catch(() => []);
+          const prev = list.find(x => /^\[feedback\]/.test(x.title) && !/update to #\d+/.test(x.title) && T.onThisPage(x.body));
+          if (prev && confirm(`You left feedback on this page before (#${prev.number}). Continue with it?`)) {
+            const mine = comments.slice();
+            await adopt(prev.number);
+            comments.push(...mine.filter(c => !comments.some(x => x.id === c.id))); save();
+          }
+        }
+      }
+    } catch (_) {}
+    makeButtons();
+    document.addEventListener("mouseover", onOver);
+    document.addEventListener("mouseup", () => setTimeout(onSelect, 0));
+    document.addEventListener("keyup", () => setTimeout(onSelect, 0));
+    document.addEventListener("pointerdown", onPointer, true);
+    document.addEventListener("selectionchange", onSelectionChange);
+    document.addEventListener("click", onClick);
+    document.addEventListener("keydown", e => { if (e.key === "Escape") closeChooser(); });
+    addEventListener("scroll", e => {
+      if (hoverBtn) hoverBtn.hidden = true; if (selBtn) selBtn.hidden = true; hoverTarget = null;
+      if (e.target !== document) scheduleMarkers();   // a panel scrolled: its markers have to move
+    }, true);
+    if (T.config.markers) {
+      addEventListener("resize", scheduleMarkers);
+      new ResizeObserver(scheduleMarkers).observe(document.body);
+      // Changes that leave the page's size alone: a dialog opening or getting new contents (a persona's Next, say), a
+      // section or knowl expanding, a picture loading. The tool's own elements are left out, or placing the markers
+      // would set this off again; and a page that keeps changing (an animation) is followed at most every 150ms.
+      const mine = n => { const e = n.nodeType === 1 ? n : n.parentElement; return !!(e && e.closest(OWN)); };
+      let soon = 0;
+      const later = () => { if (!soon) soon = setTimeout(() => { soon = 0; scheduleMarkers(); }, 150); };
+      new MutationObserver(list => {
+        if (list.some(m => !mine(m.target) && (m.type === "attributes" || [...m.addedNodes, ...m.removedNodes].some(n => !mine(n))))) later();
+      }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["open", "hidden"] });
+      document.addEventListener("toggle", later, true);
+      document.addEventListener("load", later, true);
+    }
+    showBar();
+    refresh();
+  }
+
+  // ---------- Open feedback and proposed edits ----------
+  // For contributors (from the editor), and for everyone with the showOpenFeedback option. The lists come from two
+  // requests; a thread's details are only fetched once it is picked, because GitHub allows visitors who aren't signed
+  // in only a few requests an hour. Proposed edits come from the site plug-in, if it has them.
+  let shown = new Set();    // picked: "fb-<issue>", or the key of a proposed edit
+  const states = {};        // picked key -> its cards, once fetched
+  async function listFeedback() {
+    const items = await forge.openIssues("[feedback]");
+    // In feedback mode, the person's own threads are left out: their comments are already on the page.
+    // With the topics option, issues come from several repositories, so an issue is its repo and number.
+    const id = (repo, n) => `${String(repo).toLowerCase()}#${n}`;
+    const own = new Set(active ? Object.entries(threads).map(([g, t]) => id(TOPICS ? repoOf(g) : T.config.repository, t.issue)) : []);
+    return items.filter(it => !/update to #\d+/.test(it.title) && !own.has(id(it.repo || T.config.repository, it.number)) && T.onThisPage(it.body)).map(it => ({
+      key: `fb-${it.repo ? `${it.repo}#` : ""}${it.number}`, kind: "feedback", number: it.number, repo: it.repo, url: it.url, updated: it.updated,
+      title: it.title.replace(/^\[feedback\]\s*/, "").replace(/^[^:]*:\s*/, ""),
+      author: ((it.body || "").match(/^From: (.+)$/m) || [])[1] || `@${it.user}`,
+    }));
+  }
+  const listEdits = () => site.proposedEdits ? site.proposedEdits.list() : Promise.resolve([]);
+  async function feedbackCards(it) {
+    const { state } = await latestState(it.number, it.repo);
+    const author = !state ? it.author : state.from.via === "anon" ? (state.from.name ? `${state.from.name} (anonymous)` : "anonymous") : `@${state.from.user}`;
+    return state ? state.comments.map(c => ({ ...c, id: `${it.repo ? `${it.repo}#` : ""}${it.number}-${c.id}`, issue: it.number, url: it.url, author })) : [];
+  }
+  async function cardsFor(it) {
+    if (!states[it.key]) states[it.key] = await (it.kind === "edit" ? site.proposedEdits.cards(it) : feedbackCards(it));
+    return states[it.key];
+  }
+  // Opens the picker; resolves to the number of threads shown. Proposed edits are included if the site plug-in has
+  // them, except with { edits: false } (the "Others' feedback" button, which is about feedback only).
+  function chooseOpenFeedback({ edits: withEdits = true } = {}) {
+    return new Promise(resolve => {
+      const dlg = document.createElement("dialog");
+      const edits = withEdits && !!site.proposedEdits;   // otherwise nothing mentions proposed edits
+      const head = `<h2>${edits ? "Show open feedback and edits" : "Show open feedback"}</h2>`;
+      const notice = msg => { dlg.innerHTML = `${head}<p class="fb-explain">${msg}</p><div class="fb-buttons"><button type="button" class="primary" data-p="close">Close</button></div>`; };
+      dlg.className = "fb-dialog fb-pick";
+      dlg.innerHTML = `${head}<p class="fb-explain">Looking for open feedback${edits ? " and proposed edits" : ""} on this page…</p>`;
+      document.body.appendChild(dlg); dlg.showModal();
+      let done = false;
+      const finish = () => { if (done) return; done = true; if (dlg.open) dlg.close(); dlg.remove(); resolve(shown.size); };
+      dlg.addEventListener("close", finish);
+      dlg.addEventListener("click", e => { if (e.target.closest("[data-p=close]")) finish(); });
+      const day = d => new Date(d).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+      Promise.allSettled([listFeedback(), edits ? listEdits() : Promise.resolve([])]).then(([f, e]) => {
+        if (f.status === "rejected" && e.status === "rejected") throw new Error("unreachable");
+        const list = [...(f.value || []), ...(e.value || [])].sort((x, y) => y.updated.localeCompare(x.updated));
+        const missing = f.status === "rejected" ? "feedback" : e.status === "rejected" ? "proposed edits" : "";
+        const partly = missing ? ` <b>Couldn't load the ${missing} just now; please try again in a few minutes.</b>` : "";
+        if (!list.length) return notice(edits ? `There's no open feedback and there are no proposed edits waiting for review on this page.${partly}`
+          : `There's no open feedback${active ? " from anyone else" : ""} on this page yet.${partly}`);
+        const nf = list.filter(x => x.kind === "feedback").length, ne = list.length - nf;
+        const counts = [nf && `${nf} open feedback thread${nf === 1 ? "" : "s"}`, ne && `${ne} proposed edit${ne === 1 ? "" : "s"} waiting for review`].filter(Boolean).join(" and ");
+        dlg.innerHTML = `${head}
+          <p class="fb-explain">${counts} on this page, most recent first. Pick the ones to show: they appear beside the parts of the page they're about.${partly}</p>
+          <div class="fb-pick-tools"><input type="search" placeholder="${edits ? "Filter by name, words, “feedback” or “edit”" : "Filter by name or words"}" aria-label="Filter"><button type="button" data-p="all">Select all listed</button><button type="button" data-p="none">Clear</button></div>
+          <ul class="fb-items fb-pick-list">${list.map(it => { const tag = it.kind === "edit" ? "✏️ Proposed edit" : "💬 Feedback"; return `<li data-q="${esc((tag + " " + it.author + " " + it.title).toLowerCase())}"><label>
+            <input type="checkbox" value="${it.key}"${shown.has(it.key) ? " checked" : ""}>
+            <span><span class="fb-tag fb-tag-${it.kind}">${tag}</span> <b>${esc(it.author)}</b> · ${esc(cut(it.title, 90))}<br><small>${day(it.updated)} · <a href="${esc(it.url)}" target="_blank" rel="noopener">${T.config.topics && it.repo ? esc(it.repo) : ""}#${it.number}</a></small></span></label></li>`; }).join("")}</ul>
+          <div class="fb-buttons"><button type="button" data-p="close">Cancel</button><button type="button" class="primary" data-p="show"></button></div>`;
+        const boxes = () => [...dlg.querySelectorAll(".fb-pick-list input")];
+        const count = () => { const n = boxes().filter(b => b.checked).length; dlg.querySelector("[data-p=show]").textContent = n ? `Show ${n}` : "Show none"; };
+        count();
+        dlg.querySelector("input[type=search]").addEventListener("input", e => {
+          const q = e.target.value.trim().toLowerCase();
+          dlg.querySelectorAll(".fb-pick-list li").forEach(li => { li.hidden = !!q && !li.dataset.q.includes(q); });
+        });
+        dlg.addEventListener("change", count);
+        dlg.addEventListener("click", async e => {
+          const b = e.target.closest("[data-p]"); if (!b) return;
+          if (b.dataset.p === "all" || b.dataset.p === "none") { boxes().forEach(x => { if (b.dataset.p === "none" || !x.closest("li").hidden) x.checked = b.dataset.p === "all"; }); count(); }
+          if (b.dataset.p !== "show") return;
+          const pick = list.filter(it => boxes().some(x => x.checked && x.value === it.key));
+          b.disabled = true; b.textContent = "Loading…";
+          const got = await Promise.all(pick.map(it => cardsFor(it).then(cs => [it, cs], () => [it, null])));
+          const failed = got.filter(([, cs]) => !cs).map(([it]) => `#${it.number}`);
+          shown = new Set(got.filter(([, cs]) => cs).map(([it]) => it.key));
+          reviewOn = shown.size > 0;
+          reviewItems = got.flatMap(([, cs]) => cs || []);
+          refresh();
+          const empty = got.filter(([it, cs]) => cs && it.kind === "edit" && !cs.some(c => isOnPage(c.target))).map(([it]) => `#${it.number}`);
+          if (empty.length) alert(`${empty.join(", ")} ${empty.length === 1 ? "changes" : "change"} nothing visible on this page as it is now (it may change things on another page, or have been changed by a reviewer). Open it on ${forge.name} to see it.`);
+          if (failed.length) alert(`Couldn't load ${failed.join(", ")} from ${forge.name} just now${forge.id === "github" ? " (it limits how often it can be asked)" : ""}. Try again in a few minutes.`);
+          finish();
+        });
+      }).catch(() => notice(`Couldn't reach ${esc(forge.name)} just now${forge.id === "github" ? ". It limits how often it can be asked when you aren't signed in, so" : ";"} please try again in a few minutes.`));
+    });
+  }
+  function hideOpenFeedback() { shown = new Set(); reviewOn = false; reviewItems = null; refresh(); }
+
+  return { start, refresh, chooseOpenFeedback, hideOpenFeedback };
+});
