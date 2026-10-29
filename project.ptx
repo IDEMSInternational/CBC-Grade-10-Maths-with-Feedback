@@ -6,7 +6,7 @@
 <project ptx-version="2">
   <targets>
     <target name="web" format="html" publication="publication-teacher.ptx">
-      <stringparams html.js.extra="external/permalink-review-links.js" />
+      <stringparams html.js.extra="external/feedback-setup.js" />
     </target>
     <!-- <target name="web" format="html" publication="publication-teacher.ptx">
     </target> -->
